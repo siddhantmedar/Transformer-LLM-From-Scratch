@@ -3,3 +3,7 @@ seq_length = 64
 d_model = 128
 n_vocab = 100277
 seed = 313
+num_heads = 4
+d_k = d_model // num_heads
+dropout = 0.2
+num_layers = 6

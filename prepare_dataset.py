@@ -4,26 +4,27 @@ import re
 import tiktoken
 import random
 
-from config import * 
+from config import *
 
 random.seed(seed)
 
+
 class TextDataset:
-    def __init__(self, input_file='dataset/data.txt', encoding="cl100k_base", seed=313):
+    def __init__(self, input_file="dataset/data.txt", encoding="cl100k_base", seed=313):
         super().__init__()
-        
+
         self.encoder = tiktoken.get_encoding(encoding)
 
-        with open(input_file, 'r') as file:
+        with open(input_file, "r") as file:
             text = file.read()
 
         self.data = self.preprocess_and_encode_text(text)
 
     def replace_multiple_newlines(self, text):
-        return re.sub(r'\n+', '\n', text)
+        return re.sub(r"\n+", "\n", text)
 
     def remove_bracketed_text(self, text):
-        return re.sub(r'\[\s*[^]]+\]', '', text, flags=re.DOTALL)
+        return re.sub(r"\[\s*[^]]+\]", "", text, flags=re.DOTALL)
 
     def preprocess_and_encode_text(self, text, return_tensor=False):
         text = self.remove_bracketed_text(text)
@@ -40,7 +41,7 @@ class TextDataset:
             while idx + seq_length >= len(self.data):
                 idx = random.sample(range(len(self.data)), 1)[0]
 
-            X.append(self.data[idx:idx + seq_length])
-            y.append(self.data[idx + 1:idx + seq_length + 1])
-        
+            X.append(self.data[idx : idx + seq_length])
+            y.append(self.data[idx + 1 : idx + seq_length + 1])
+
         return torch.tensor(X), torch.tensor(y)
