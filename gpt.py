@@ -8,6 +8,8 @@ from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 import os
 import time
+import sys
+from torch.cuda.amp import autocast, GradScaler
 
 # Device definition
 device = torch.device(
@@ -20,7 +22,7 @@ if device.type == "mps":
 
 # Load and prepare data
 dataset_dir = "dataset"
-dataset_file = os.path.join(dataset_dir, "input.txt")
+dataset_file = os.path.join(dataset_dir, "combined.txt")
 try:
     if not os.path.exists(dataset_dir):
         raise FileNotFoundError(f"Directory '{dataset_dir}' does not exist")
@@ -28,11 +30,8 @@ try:
         raise FileNotFoundError(f"File '{dataset_file}' does not exist")
     with open(dataset_file, 'r', encoding='utf-8') as f:
         text = f.read()
-except UnicodeDecodeError:
-    print(f"Error: '{dataset_file}' is not UTF-8 encoded. Please ensure the file uses UTF-8 encoding.")
-    raise
-except (FileNotFoundError, PermissionError) as e:
-    print(f"Error: {e}")
+except (FileNotFoundError, PermissionError, UnicodeDecodeError, IOError) as e:
+    print(f"Error loading dataset: {e}")
     raise
 
 if not text.strip():
@@ -46,6 +45,8 @@ expected_vocab_size = 20000
 try:
     if not os.path.exists(tokenizer_dir):
         os.makedirs(tokenizer_dir)
+    if not os.access(tokenizer_dir, os.W_OK):
+        raise PermissionError(f"Directory '{tokenizer_dir}' is not writable")
     if not os.path.exists(tokenizer_path):
         tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
@@ -98,6 +99,11 @@ else:
 
 # Encode dataset
 data = torch.tensor(encode(text), dtype=torch.long).to(device)
+
+# Check dataset size
+max_data_size = 1e8  # Max 100M tokens
+if len(data) > max_data_size:
+    print(f"Warning: Dataset size ({len(data)} tokens) exceeds recommended limit ({max_data_size}). Consider subsampling.")
 
 @dataclass
 class Config:
@@ -214,22 +220,28 @@ class Decoder(nn.Module):
         return self.fnn(self.mmha(x))
 
 class DecoderBlock(nn.Module):
-    def __init__(self, n_layers, n_vocab, d_model, num_head, dropout=0.1):
+    def __init__(self, n_layers, n_vocab, d_model, num_head, max_seq_len, dropout=0.1):
         super().__init__()
+        self.embedding = Embeddding(n_vocab, d_model, max_seq_len, dropout)
         self.decoder_layers = nn.ModuleList(
             [Decoder(d_model, num_head, dropout) for _ in range(n_layers)]
         )
+        self.norm = nn.LayerNorm(d_model)
         self.fc = nn.Linear(d_model, n_vocab)
 
     def forward(self, x):
+        x = self.embedding(x)
         for layer in self.decoder_layers:
             x = layer(x)
+        x = self.norm(x)
         return self.fc(x)
 
-def train(model, config, train_data, val_data, device, tokenizer, epochs=10, batch_size=32, patience=3):
+def train(model, config, train_data, val_data, device, tokenizer, epochs=20, batch_size=64, patience=3):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id("[PAD]"))
+    scaler = GradScaler()
     best_val_loss = float('inf')
     epochs_no_improve = 0
     checkpoint_dir = "model_checkpoints"
@@ -240,11 +252,14 @@ def train(model, config, train_data, val_data, device, tokenizer, epochs=10, bat
         for _ in range(config.batches_per_epoch):
             x, y = get_batch('train', batch_size, config.block_size)
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.view(-1, config.n_vocab), y.view(-1))
-            loss.backward()
+            with autocast():
+                logits = model(x)
+                loss = criterion(logits.view(-1, config.n_vocab), y.view(-1))
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             total_train_loss += loss.item()
         avg_train_loss = total_train_loss / config.batches_per_epoch
 
@@ -255,23 +270,36 @@ def train(model, config, train_data, val_data, device, tokenizer, epochs=10, bat
             with torch.no_grad():
                 for _ in range(config.batches_per_epoch // 10):
                     x, y = get_batch('val', batch_size, config.block_size)
-                    logits = model(x)
-                    loss = criterion(logits.view(-1, config.n_vocab), y.view(-1))
+                    with autocast():
+                        logits = model(x)
+                        loss = criterion(logits.view(-1, config.n_vocab), y.view(-1))
                     total_val_loss += loss.item()
             avg_val_loss = total_val_loss / (config.batches_per_epoch // 10)
+            perplexity = math.exp(avg_val_loss)
+            scheduler.step(avg_val_loss)
         else:
             print("Warning: Validation data too short or empty, skipping validation")
             avg_val_loss = float('inf')
+            perplexity = float('inf')
 
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}" +
-              (f", Val Loss: {avg_val_loss:.4f}" if valid_val_loss else ""))
+              (f", Val Loss: {avg_val_loss:.4f}, Perplexity: {perplexity:.2f}" if valid_val_loss else ""))
 
         if valid_val_loss and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             try:
                 if not os.path.exists(checkpoint_dir):
                     os.makedirs(checkpoint_dir)
-                torch.save(model.state_dict(), checkpoint_path)
+                if not os.access(checkpoint_dir, os.W_OK):
+                    raise PermissionError(f"Directory '{checkpoint_dir}' is not writable")
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'best_val_loss': best_val_loss
+                }
+                torch.save(checkpoint, checkpoint_path)
                 print(f"Saved best model with Val Loss: {best_val_loss:.4f}")
             except (FileNotFoundError, PermissionError, OSError) as e:
                 print(f"Error saving model checkpoint: {e}")
@@ -283,7 +311,7 @@ def train(model, config, train_data, val_data, device, tokenizer, epochs=10, bat
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
 
-def generate(model, prompt, max_tokens=50, temperature=1.0):
+def generate(model, prompt, max_tokens=50, temperature=1.0, return_ids=False):
     if not prompt.strip():
         print("Warning: Empty prompt provided, using default")
         prompt = "[CLS]"
@@ -294,18 +322,24 @@ def generate(model, prompt, max_tokens=50, temperature=1.0):
     tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
     for _ in range(max_tokens):
         input_tokens = tokens[:, -config.block_size:]
-        logits = model(input_tokens)
+        with autocast():
+            logits = model(input_tokens)
         logits = logits[:, -1, :] / temperature
         probs = torch.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         tokens = torch.cat([tokens, next_token], dim=1)
-    return decode(tokens[0].tolist())
+    token_ids = tokens[0].tolist()
+    if return_ids:
+        return token_ids
+    return decode(token_ids)
 
 if __name__ == "__main__":
     try:
         model = DecoderBlock(
-            config.n_layers, config.n_vocab, config.d_model, config.num_head, dropout=0.1
+            config.n_layers, config.n_vocab, config.d_model, config.num_head, config.max_seq_length, dropout=0.1
         ).to(device)
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model size: {total_params:,} parameters ({total_params / 1e6:.2f}M)")
         train(model, config, train_data, val_data, device, tokenizer, patience=3)
         print(generate(model, "The quick brown fox", max_tokens=50))
     except Exception as e:
