@@ -22,7 +22,7 @@ if device.type == "mps":
 
 # Load and prepare data
 dataset_dir = "dataset"
-dataset_file = os.path.join(dataset_dir, "combined.txt")
+dataset_file = os.path.join(dataset_dir, "tiny_shakespeare.txt")
 try:
     if not os.path.exists(dataset_dir):
         raise FileNotFoundError(f"Directory '{dataset_dir}' does not exist")
@@ -35,7 +35,7 @@ except (FileNotFoundError, PermissionError, UnicodeDecodeError, IOError) as e:
     raise
 
 if not text.strip():
-    print("Error: 'dataset/input.txt' is empty")
+    print("Error: 'dataset/tiny_shakespeare.txt' is empty")
     raise ValueError("Dataset file is empty")
 
 # Train BPE tokenizer
@@ -341,7 +341,7 @@ if __name__ == "__main__":
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model size: {total_params:,} parameters ({total_params / 1e6:.2f}M)")
         train(model, config, train_data, val_data, device, tokenizer, patience=3)
-        print(generate(model, "The quick brown fox", max_tokens=50))
+        print(generate(model, "Music", max_tokens=50))
     except Exception as e:
         print(f"Error during execution: {e}")
         raise
